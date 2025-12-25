@@ -1,0 +1,9 @@
+﻿__pycache__/
+*.pyc
+.pytest_cache/
+.vscode/
+workspace/
+temp_*.png
+temp_*.obj
+*.log
+external/spconv_build/
