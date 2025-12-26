@@ -3,9 +3,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.so
-*.dll
-*.dylib
 
 # Env
 .venv/
@@ -21,8 +18,8 @@ Thumbs.db
 # Logs
 *.log
 
-# BIG generated outputs / caches (don’t commit)
-workspace/
+# --- Generated outputs / runs (never commit) ---
+workspace*/
 outputs/
 output/
 runs/
@@ -30,18 +27,16 @@ results/
 tmp/
 temp/
 cache/
-models/
-checkpoints/
-weights/
-*.ckpt
-*.safetensors
-*.pt
-*.pth
-*.onnx
-*.engine
 
-# 3D assets (usually generated, keep out unless you REALLY need them)
+# --- Large binaries / installers (never commit) ---
+*.exe
+*.msi
+*.zip
+*.7z
+
+# --- 3D outputs (usually generated) ---
 *.obj
+*.mtl
 *.fbx
 *.stl
 *.glb
@@ -49,9 +44,8 @@ weights/
 *.ply
 *.usd
 *.usdz
-*.mtl
 
-# Images/videos generated
+# --- Generated images/videos ---
 *.png
 *.jpg
 *.jpeg
@@ -60,25 +54,18 @@ weights/
 *.mov
 *.gif
 
-# accidental terminal paste files
-*PSIsContainer*
-*Select Name*
-
-
-# --- Large ML artifacts (never commit) ---
+# --- Large ML artifacts ---
 ckpts/
 **/ckpts/
 weights/
 **/weights/
 models/
 **/models/
-tsr/model.ckpt
+datasets/
+**/datasets/
 *.ckpt
 *.safetensors
 *.pt
 *.pth
 *.onnx
 *.engine
-*.zip
-datasets/
-**/datasets/
