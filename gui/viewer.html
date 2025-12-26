@@ -1,0 +1,199 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NeoForge 3D Preview</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #111 }
+    #canvas { width: 100%; height: 100%; display:block }
+    #overlay { position: absolute; left: 10px; top: 10px; color: #ddd; font-family: Arial, sans-serif; }
+  </style>
+</head>
+<body>
+<div id="overlay">3D Preview</div>
+<canvas id="canvas"></canvas>
+<script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.154.0/build/three.module.js';
+  import { OrbitControls } from 'https://unpkg.com/three@0.154.0/examples/jsm/controls/OrbitControls.js';
+  import { GLTFLoader } from 'https://unpkg.com/three@0.154.0/examples/jsm/loaders/GLTFLoader.js';
+
+  let scene, camera, renderer, controls, loader, current;
+  const canvas = document.getElementById('canvas');
+
+  function init(){
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setClearColor(0x111111);
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 0.8, 2.4);
+    controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+    hemi.position.set(0, 1, 0);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(5,10,7);
+    scene.add(dir);
+
+    loader = new GLTFLoader();
+
+    // initialize Qt WebChannel bridge when available
+    if (typeof QWebChannel !== 'undefined') {
+      new QWebChannel(qt.webChannelTransport, function(channel) {
+        window.qt = channel.objects.bridge;
+        // If the bridge supports fileLoaded, register handler for base64 payloads
+        try {
+          if (window.qt && window.qt.fileLoaded) {
+            window.qt.fileLoaded.connect(function(path, b64) {
+              console.log('Bridge: fileLoaded received for', path, 'payload length', b64 ? b64.length : 0);
+              if (!b64) {
+                console.error('Bridge: failed to read local file', path);
+                return;
+              }
+              // Decode base64 to ArrayBuffer
+              try {
+                var binary_string = atob(b64);
+                var len = binary_string.length;
+                var bytes = new Uint8Array(len);
+                for (var i = 0; i < len; i++) {
+                  bytes[i] = binary_string.charCodeAt(i);
+                }
+                var ab = bytes.buffer;
+                // Parse the GLTF/GLB from the array buffer
+                loader.parse(ab, '', function(gltf) {
+                  console.log('Bridge: parsed GLTF from fileLoaded, adding to scene');
+                  clearCurrent();
+                  current = gltf.scene;
+                  const box = new THREE.Box3().setFromObject(current);
+                  const size = new THREE.Vector3();
+                  box.getSize(size);
+                  const maxDim = Math.max(size.x, size.y, size.z);
+                  const scale = 1.0 / (maxDim || 1.0);
+                  current.scale.setScalar(scale);
+                  box.getCenter(new THREE.Vector3()).negate();
+                  current.position.copy(box.getCenter(new THREE.Vector3()));
+                  scene.add(current);
+                  try { if (window.qt && window.qt.modelLoaded) { console.log('Bridge: invoking modelLoaded on host (parsed)'); window.qt.modelLoadedMsg('parsed'); } } catch(e){ console.error(e); }
+                }, function(err){ console.error('Bridge: GLTF parse error', err); try { if (window.qt && window.qt.modelLoadedMsg) { window.qt.modelLoadedMsg('error:' + (err && err.message ? err.message : String(err))); } } catch(e){ console.error(e); } });
+              } catch(e) {
+                console.error('Failed to decode base64 model:', e);
+              }
+            });
+          }
+        } catch(e) {
+          console.error('Error registering bridge.fileLoaded handler', e);
+        }
+      });
+
+      // also expose a direct base64 loader for robust fallback
+      window._loadBase64Model = function(b64) {
+        if (!b64) { console.error('No base64 payload'); return; }
+        try {
+          var binary_string = atob(b64);
+          var len = binary_string.length;
+          var bytes = new Uint8Array(len);
+          for (var i = 0; i < len; i++) {
+            bytes[i] = binary_string.charCodeAt(i);
+          }
+          var ab = bytes.buffer;
+          loader.parse(ab, '', function(gltf) {
+            console.log('Viewer console: base64 GLTF parsed successfully');
+            clearCurrent();
+            current = gltf.scene;
+            const box = new THREE.Box3().setFromObject(current);
+            const size = new THREE.Vector3();
+            box.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const scale = 1.0 / (maxDim || 1.0);
+            current.scale.setScalar(scale);
+            box.getCenter(new THREE.Vector3()).negate();
+            current.position.copy(box.getCenter(new THREE.Vector3()));
+            scene.add(current);
+            try { if (window.qt && window.qt.modelLoaded) { window.qt.modelLoaded('parsed'); } } catch(e){ console.error(e); }
+          }, function(err){ console.error('Viewer console: GLTF parse error', err); try { if (window.qt && window.qt.modelLoadedMsg) { window.qt.modelLoadedMsg('error:' + (err && err.message ? err.message : String(err))); } } catch(e){ console.error(e); } });
+        } catch(e) {
+          console.error('Failed to load base64 model', e);
+        }
+      }
+    }
+
+    window.addEventListener('resize', ()=>{
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    animate();
+  }
+
+  function clearCurrent(){
+    if(!current) return;
+    scene.remove(current);
+    current.traverse((c)=>{ if(c.geometry) c.geometry.dispose(); if(c.material){ if(Array.isArray(c.material)){ c.material.forEach(m=>m.dispose()); } else { c.material.dispose(); } }});
+    current = null;
+  }
+
+  function loadModel(url){
+    // url: string file://.../model.glb
+    if(!loader) return;
+    console.log('Viewer console: loadModel called for', url);
+    clearCurrent();
+    // If this is a local file URL and the WebChannel bridge is available, request the binary from the host
+    try {
+      if (typeof url === 'string' && url.startsWith('file://') && window.qt && window.qt.loadLocalFile) {
+        // ask host to read the file and return base64 via fileLoaded signal
+        try {
+          console.log('Requesting host to load local file via WebChannel', url);
+          window.qt.loadLocalFile(url);
+          return;
+        } catch(e) {
+          console.error('Bridge loadLocalFile call failed', e);
+        }
+      }
+    } catch(e) {
+      console.error('Error checking for local file bridge', e);
+    }
+
+    loader.load(url, (gltf)=>{
+      console.log('Viewer console: loader.load succeeded for', url);
+      current = gltf.scene;
+      // center and scale
+      const box = new THREE.Box3().setFromObject(current);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const scale = 1.0 / (maxDim || 1.0);
+      current.scale.setScalar(scale);
+      box.getCenter(new THREE.Vector3()).negate();
+      current.position.copy(box.getCenter(new THREE.Vector3()));
+      scene.add(current);
+      // notify host that the model finished loading
+      try {
+        if (window.qt && window.qt.modelLoadedMsg) {
+          console.log('Notifying host that model loaded');
+          window.qt.modelLoadedMsg('loaded');
+        }
+      } catch (e) {
+        console.error('Error notifying host modelLoaded', e);
+      }
+    }, (xhr)=>{
+      // progress optionally reported
+    }, (err)=>{
+      console.error('Viewer console: GLTF load error', err);
+    });
+  }
+
+  function animate(){
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+
+  init();
+  // expose to window
+  window.loadModel = loadModel;
+</script>
+</body>
+</html>

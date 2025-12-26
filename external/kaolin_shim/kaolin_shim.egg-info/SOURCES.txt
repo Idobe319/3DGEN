@@ -1,0 +1,8 @@
+setup.py
+kaolin/__init__.py
+kaolin/utils/__init__.py
+kaolin/utils/testing.py
+kaolin_shim.egg-info/PKG-INFO
+kaolin_shim.egg-info/SOURCES.txt
+kaolin_shim.egg-info/dependency_links.txt
+kaolin_shim.egg-info/top_level.txt

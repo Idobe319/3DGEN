@@ -1,0 +1,1078 @@
+import sys
+import os
+import re
+import json
+import base64
+import subprocess
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from PySide6.QtWebEngineWidgets import QWebEnginePage as _QWebEnginePage  # type: ignore[reportMissingImports]
+else:
+    _QWebEnginePage = None  # type: ignore
+
+try:
+    import torch
+    _GPU_NAME = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+except Exception:
+    _GPU_NAME = None
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QFileDialog,
+    QLabel,
+    QSpinBox,
+    QCheckBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QLineEdit,
+    QListWidget,
+    QSplitter,
+    QToolBar,
+    QDialog,
+    QFormLayout,
+    QDialogButtonBox,
+    QMessageBox,
+)
+from PySide6.QtGui import QIcon, QPixmap, QAction
+from PySide6.QtCore import QProcess, Qt, QSettings, QUrl
+# Web view widget
+try:
+    # Import QWebEngineView and try to import QWebEnginePage from common locations.
+    # Use `type: ignore` to silence Pylance missing-symbol diagnostics in environments
+    # without QtWebEngine stubs installed.
+    from PySide6.QtWebEngineWidgets import QWebEngineView  # type: ignore[reportMissingImports]
+    QWebEnginePage = None
+    try:
+        from PySide6.QtWebEngineWidgets import QWebEnginePage  # type: ignore[reportMissingImports]
+    except Exception:
+        try:
+            from PySide6.QtWebEngineCore import QWebEnginePage  # type: ignore[reportMissingImports]
+        except Exception:
+            QWebEnginePage = None
+
+    from PySide6.QtWebChannel import QWebChannel  # type: ignore[reportMissingImports]
+    from PySide6.QtCore import QObject, Slot, Signal
+
+    class WebBridge(QObject):
+        modelLoadedSignal = Signal()
+        # Emitted when a local file was read; args: path, base64_data
+        fileLoaded = Signal(str, str)
+
+        @Slot()
+        def modelLoaded(self):
+            # Generic notification without payload
+            try:
+                cb = getattr(self, '_host_log_cb', None)
+                if callable(cb):
+                    cb('modelLoaded (no message)')
+            except Exception:
+                pass
+            self.modelLoadedSignal.emit()
+
+        @Slot(str)
+        def modelLoadedMsg(self, msg: str):
+            # Notification carrying a short status/message from the viewer
+            try:
+                cb = getattr(self, '_host_log_cb', None)
+                if callable(cb):
+                    cb(f'modelLoaded: {msg}')
+            except Exception:
+                pass
+            self.modelLoadedSignal.emit()
+
+        @Slot(str)
+        def loadLocalFile(self, path: str):
+            # Read the requested local file and emit base64 data back to JS
+            try:
+                # notify host UI (if callback attached) that a request arrived
+                try:
+                    cb = getattr(self, '_host_log_cb', None)
+                    if callable(cb):
+                        cb(f'Received loadLocalFile request: {path}')
+                except Exception:
+                    pass
+                # normalize path
+                p = path
+                # strip file:// prefix if present
+                if p.startswith('file://'):
+                    # On Windows file URLs may be file:///C:/...
+                    p = p[7:] if p.startswith('file:///') else p[5:]
+                with open(p, 'rb') as fh:
+                    data = fh.read()
+                try:
+                    cb = getattr(self, '_host_log_cb', None)
+                    if callable(cb):
+                        cb(f'Read {len(data)} bytes from local file')
+                except Exception:
+                    pass
+                b64 = base64.b64encode(data).decode('ascii')
+                self.fileLoaded.emit(path, b64)
+            except Exception as e:
+                # notify host UI
+                try:
+                    cb = getattr(self, '_host_log_cb', None)
+                    if callable(cb):
+                        cb(f'loadLocalFile error: {e}')
+                except Exception:
+                    pass
+                # Emit empty payload to signal failure
+                try:
+                    self.fileLoaded.emit(path, '')
+                except Exception:
+                    pass
+
+    # Create DebugWebPage at runtime using `type()` so static analyzers do not
+    # see a variable used as a base class. The generated class will call the
+    # real QWebEnginePage.__init__ when available and provide a console bridge.
+    def _dbg_init(self, parent=None, log_callback=None):
+        try:
+            if QWebEnginePage is not None:
+                try:
+                    QWebEnginePage.__init__(self, parent)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # store callback for console messages
+        self._log_cb = log_callback
+
+    def _dbg_console(self, level, message, lineNumber, sourceID):  # type: ignore[override]
+        try:
+            if getattr(self, '_log_cb', None):
+                self._log_cb(f'Viewer console: {message} (line {lineNumber})')
+        except Exception:
+            pass
+
+    if QWebEnginePage is not None:
+        DebugWebPage = type('DebugWebPage', (QWebEnginePage,), {'__init__': _dbg_init, 'javaScriptConsoleMessage': _dbg_console})
+    else:
+        DebugWebPage = type('DebugWebPage', (object,), {'__init__': _dbg_init, 'javaScriptConsoleMessage': _dbg_console})
+except Exception:
+    QWebEngineView = None
+    QWebChannel = None
+    QObject = None
+    Slot = None
+    Signal = None
+    WebBridge = None  # type: ignore
+
+# alias common Qt enum members so Pylance recognizes them (use type: ignore to silence pyi gaps)
+_QT_HORIZONTAL = Qt.Horizontal  # type: ignore[attr-defined]
+_QT_ALIGN_CENTER = Qt.AlignCenter  # type: ignore[attr-defined]
+_QT_KEEP_ASPECT = Qt.KeepAspectRatio  # type: ignore[attr-defined]
+_QT_SMOOTH_TRANS = Qt.SmoothTransformation  # type: ignore[attr-defined]
+
+
+ROOT = Path(__file__).resolve().parents[1]
+_SETTINGS = QSettings('NeoForge', 'Desktop')
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Settings')
+        layout = QFormLayout(self)
+        self.default_output = QLineEdit(str(_SETTINGS.value('output_dir', 'workspace')))
+        self.blender_path = QLineEdit(str(_SETTINGS.value('blender_exe', '')))
+        self.trellis_path = QLineEdit(str(_SETTINGS.value('trellis_weights', '')))
+        layout.addRow('Default output folder:', self.default_output)
+        layout.addRow('Blender executable (optional):', self.blender_path)
+        layout.addRow('TRELLIS weights (optional):', self.trellis_path)
+        # Use OK/Cancel standard buttons for compatibility
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def accept(self):
+        _SETTINGS.setValue('output_dir', self.default_output.text())
+        _SETTINGS.setValue('blender_exe', self.blender_path.text())
+        _SETTINGS.setValue('trellis_weights', self.trellis_path.text())
+        super().accept()
+
+
+class DesktopApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('NeoForge Studio')
+        self.setMinimumSize(1000, 600)
+
+        self.process = None
+        self.input_path = None
+
+        self._build_ui()
+        self._load_settings()
+        self._apply_styles()
+
+    def _build_ui(self):
+        tb = QToolBar(self)
+        tb.setWindowTitle('Main')
+        self.addToolBar(tb)
+        open_act = QAction(QIcon(), 'Open Image', self)
+        open_act.triggered.connect(self._on_open)
+        tb.addAction(open_act)
+        run_act = QAction(QIcon(), 'Run', self)
+        run_act.triggered.connect(self.run_pipeline)
+        tb.addAction(run_act)
+        stop_act = QAction(QIcon(), 'Stop', self)
+        stop_act.triggered.connect(self.stop_pipeline)
+        tb.addAction(stop_act)
+        settings_act = QAction(QIcon(), 'Settings', self)
+        settings_act.triggered.connect(self.open_settings)
+        tb.addAction(settings_act)
+        # Auto Setup action
+        self.auto_act = QAction(QIcon(), 'Auto Setup', self)
+        self.auto_act.triggered.connect(self._auto_setup)
+        tb.addAction(self.auto_act)
+
+        # Developer utility: test viewer load flow (WebChannel/base64/file://)
+        self.test_viewer_act = QAction(QIcon(), 'Test Viewer', self)
+        self.test_viewer_act.triggered.connect(self._test_viewer_load)
+        tb.addAction(self.test_viewer_act)
+
+        # Launch NeoForge Command Center (CustomTkinter UI)
+        self.cmd_center_act = QAction(QIcon(), 'Command Center', self)
+        self.cmd_center_act.triggered.connect(self._open_command_center)
+        tb.addAction(self.cmd_center_act)
+
+        splitter = QSplitter(_QT_HORIZONTAL)
+        left = QWidget()
+        left_l = QVBoxLayout(left)
+
+        self.input_label = QLabel('Drop an image here or click Open')
+        self.input_label.setAlignment(_QT_ALIGN_CENTER)
+        self.input_label.setFixedHeight(120)
+        left_l.addWidget(self.input_label)
+
+        # Small input image preview (shows the user's selected image)
+        self.input_preview = QLabel()
+        self.input_preview.setAlignment(_QT_ALIGN_CENTER)
+        self.input_preview.setStyleSheet('background: #222; color: #ddd; border: 1px solid #2b2b2b;')
+        self.input_preview.setFixedSize(240, 160)
+        left_l.addWidget(self.input_preview)
+
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel('Target verts:'))
+        self.spin_verts = QSpinBox()
+        self.spin_verts.setRange(256, 200000)
+        self.spin_verts.setSingleStep(256)
+        self.spin_verts.setValue(int(str(_SETTINGS.value('default_poly', 2500))))
+        opts.addWidget(self.spin_verts)
+
+        # Quality presets
+        opts.addWidget(QLabel('Quality:'))
+        from PySide6.QtWidgets import QComboBox
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(['low', 'medium', 'high', 'custom'])
+        self.quality_combo.setCurrentText(str(_SETTINGS.value('default_quality', 'medium')))
+        opts.addWidget(self.quality_combo)
+
+        left_l.addLayout(opts)
+
+        # Custom overrides (only enabled when 'custom' selected)
+        self.custom_mc = QSpinBox()
+        self.custom_mc.setRange(64, 1024)
+        self.custom_mc.setValue(512)
+        self.custom_mc.setPrefix('MC:')
+        self.custom_mc.setToolTip('Marching cube resolution (custom)')
+        self.custom_mc.setVisible(False)
+        left_l.addWidget(self.custom_mc)
+
+        self.custom_tex = QSpinBox()
+        self.custom_tex.setRange(512, 8192)
+        self.custom_tex.setValue(2048)
+        self.custom_tex.setPrefix('Tex:')
+        self.custom_tex.setToolTip('Texture resolution (custom)')
+        self.custom_tex.setVisible(False)
+        left_l.addWidget(self.custom_tex)
+
+        def _on_quality_change(idx):
+            txt = self.quality_combo.currentText()
+            is_custom = txt == 'custom'
+            self.custom_mc.setVisible(is_custom)
+            self.custom_tex.setVisible(is_custom)
+        self.quality_combo.currentIndexChanged.connect(_on_quality_change)
+
+        # Ensure QCheckBox is available in this scope for static analyzers
+        self.chk_bake = QCheckBox('Bake textures (Blender required)')
+        left_l.addWidget(self.chk_bake)
+        # Option to override GPU memory checks and force high quality
+        self.chk_force_high = QCheckBox('Force High Quality (override GPU check)')
+        left_l.addWidget(self.chk_force_high)
+
+        self.trellis_input = QLineEdit()
+        self.trellis_input.setPlaceholderText('Optional: path to tsr/model.ckpt')
+        self.trellis_input.setText(str(_SETTINGS.value('trellis_weights', '')))
+        left_l.addWidget(self.trellis_input)
+
+        self.blender_input = QLineEdit()
+        self.blender_input.setPlaceholderText('Optional: blender executable path')
+        self.blender_input.setText(str(_SETTINGS.value('blender_exe', '')))
+        left_l.addWidget(self.blender_input)
+
+        # Optional render / metrics toggles
+        self.chk_render = QCheckBox('Render (NeRF)')
+        self.chk_metrics = QCheckBox('Compute metrics')
+        left_l.addWidget(self.chk_render)
+        left_l.addWidget(self.chk_metrics)
+
+        self.recent_list = QListWidget()
+        self.recent_list.setMaximumHeight(120)
+        self.recent_list.itemClicked.connect(self._open_recent)
+        left_l.addWidget(QLabel('Recent'))
+        left_l.addWidget(self.recent_list)
+
+        left_l.addStretch()
+        left.setLayout(left_l)
+
+        center = QWidget()
+        center_l = QVBoxLayout(center)
+        # Replace the simple image preview with an interactive 3D WebGL viewer where available
+        if QWebEngineView is not None:
+            self.web_view = QWebEngineView()
+            # Attach a debug page so console messages are captured in the UI log
+            try:
+                # Construct without kwargs (static analyzers can't see the dynamic
+                # type signature). Attach parent and log callback at runtime.
+                page = DebugWebPage()
+                try:
+                    try:
+                        setattr(page, '_log_cb', lambda m: self.log.appendPlainText(m))
+                    except Exception:
+                        pass
+                    try:
+                        sp = getattr(page, 'setParent', None)
+                        if callable(sp):
+                            sp(self.web_view)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                if QWebEnginePage is not None:
+                    try:
+                        from typing import cast
+                        self.web_view.setPage(cast(_QWebEnginePage, page))
+                    except Exception:
+                        try:
+                            self.web_view.setPage(page)  # type: ignore[arg-type]
+                        except Exception:
+                            pass
+                else:
+                    try:
+                        self.web_view.setPage(page)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            viewer_url = QUrl.fromLocalFile(str(ROOT / 'gui' / 'viewer.html'))
+            self.web_view.setUrl(viewer_url)
+            self.web_view.setFixedHeight(360)
+            # Loading overlay (hidden by default)
+            self.loading_overlay = QWidget(self.web_view)
+            self.loading_overlay.setStyleSheet('background: rgba(0,0,0,0.6);')
+            self.loading_overlay.setGeometry(0, 0, self.web_view.width(), self.web_view.height())
+            lv = QVBoxLayout(self.loading_overlay)
+            lv.setContentsMargins(10, 10, 10, 10)
+            lv.addStretch()
+            self.loading_label = QLabel('Loading model...')
+            self.loading_label.setStyleSheet('color: #fff; font-weight: bold;')
+            lv.addWidget(self.loading_label, alignment=_QT_ALIGN_CENTER)
+            self.loading_bar = QProgressBar()
+            self.loading_bar.setRange(0, 0)
+            self.loading_bar.setFixedHeight(10)
+            lv.addWidget(self.loading_bar)
+            lv.addStretch()
+            self.loading_overlay.setVisible(False)
+            center_l.addWidget(self.web_view)
+            self.preview = None
+
+            # If WebChannel is available, register a bridge so JS can notify us
+            try:
+                if QWebChannel is not None:
+                    self.web_bridge = WebBridge()
+                    self.web_bridge.modelLoadedSignal.connect(self._on_viewer_model_loaded)                    # attach host-side log callback so the bridge can surface events to the UI
+                    try:
+                        setattr(self.web_bridge, '_host_log_cb', lambda m: self.log.appendPlainText('Bridge: ' + str(m)))
+                    except Exception:
+                        pass                    # fileLoaded is emitted by the bridge when Python reads a local file; JS listens to it
+                    self.web_bridge.fileLoaded.connect(lambda path, b64: self.log.appendPlainText(f'Local file served to viewer: {path} (size={len(b64)} bytes)'))
+                    self.web_channel = QWebChannel(self.web_view.page())
+                    self.web_channel.registerObject('bridge', self.web_bridge)
+                    self.web_view.page().setWebChannel(self.web_channel)
+            except Exception:
+                pass
+        else:
+            # Fallback to QLabel preview if WebEngine not available
+            self.preview = QLabel()
+            self.preview.setAlignment(_QT_ALIGN_CENTER)
+            self.preview.setStyleSheet('background: #111; color: #ddd')
+            self.preview.setFixedHeight(320)
+            center_l.addWidget(self.preview)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        center_l.addWidget(self.progress)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        center_l.addWidget(self.log, stretch=1)
+        center.setLayout(center_l)
+
+        right = QWidget()
+        right_l = QVBoxLayout(right)
+        right_l.addWidget(QLabel('Outputs'))
+        self.outputs = QListWidget()
+        self.outputs.itemClicked.connect(self._open_output)
+        right_l.addWidget(self.outputs)
+
+        # Auto-setup status indicators
+        right_l.addWidget(QLabel('Auto Setup Status'))
+        self.cfg_status = QLabel('Config: unknown')
+        self.weights_status = QLabel('Weights: unknown')
+        self.im_status = QLabel('Instant Meshes: unknown')
+        right_l.addWidget(self.cfg_status)
+        right_l.addWidget(self.weights_status)
+        right_l.addWidget(self.im_status)
+
+        right.setLayout(right_l)
+
+        splitter.addWidget(left)
+        splitter.addWidget(center)
+        splitter.addWidget(right)
+        splitter.setSizes([250, 500, 200])
+
+        self.setCentralWidget(splitter)
+        self.setAcceptDrops(True)
+
+        # status
+        gpu = _GPU_NAME or 'No CUDA GPU detected'
+        viewer_state = 'Enabled' if QWebEngineView is not None else 'Unavailable (install PySide6 QtWebEngine)'
+        self.statusBar().showMessage(f'GPU: {gpu} | 3D Viewer: {viewer_state}')
+
+    def _apply_styles(self):
+        self.setStyleSheet('''
+            QMainWindow { background: #121212; color: #eee }
+            QLabel { color: #ddd }
+            QPlainTextEdit { background: #0b0b0b; color: #9f9f9f; font-family: Consolas; }
+            QLineEdit, QSpinBox, QListWidget { background: #1b1b1b; color: #eee }
+            QPushButton { background: #2b6ea3; color: white; padding: 6px }
+        ''')
+
+    def _load_settings(self):
+        recent = _SETTINGS.value('recent_files', [])
+        if not isinstance(recent, (list, tuple)):
+            recent = []
+        for r in recent:
+            self.recent_list.addItem(str(r))
+
+    def _save_recent(self, path):
+        items = [self.recent_list.item(i).text() for i in range(self.recent_list.count())]
+        if path in items:
+            items.remove(path)
+        items.insert(0, path)
+        items = items[:10]
+        self.recent_list.clear()
+        for it in items:
+            self.recent_list.addItem(it)
+        _SETTINGS.setValue('recent_files', items)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        p = urls[0].toLocalFile()
+        if os.path.exists(p):
+            self.set_input(p)
+
+    def _on_open(self):
+        f, _ = QFileDialog.getOpenFileName(self, 'Select input image', str(ROOT), 'Images (*.png *.jpg *.jpeg *.bmp)')
+        if f:
+            self.set_input(f)
+
+    def _open_recent(self, item):
+        self.set_input(item.text())
+
+    def set_input(self, path):
+        self.input_path = path
+        self.input_label.setText(path)
+        try:
+            pix = QPixmap(path)
+            # Update left-side input preview (thumbnail)
+            try:
+                if not pix.isNull() and isinstance(self.input_preview, QLabel):
+                    self.input_preview.setPixmap(pix.scaled(self.input_preview.width(), self.input_preview.height(), _QT_KEEP_ASPECT, _QT_SMOOTH_TRANS))
+            except Exception:
+                pass
+
+            # Also update central preview if present (QLabel fallback)
+            preview = getattr(self, 'preview', None)
+            if not pix.isNull() and isinstance(preview, QLabel):
+                preview.setPixmap(pix.scaled(preview.width(), preview.height(), _QT_KEEP_ASPECT, _QT_SMOOTH_TRANS))
+        except Exception:
+            pass
+        self._save_recent(path)
+
+    def run_pipeline(self):
+        if not self.input_path:
+            QMessageBox.warning(self, 'No input', 'Please select an input image first.')
+            return
+        # Clear previous outputs from prior runs to avoid stale timestamped entries
+        try:
+            self.outputs.clear()
+        except Exception:
+            pass
+        # Also sanitize any pre-existing entries to normalize paths (handles older logs)
+        try:
+            self._sanitize_outputs()
+        except Exception:
+            pass
+        args = [sys.executable, str(ROOT / 'run_local.py'), '--input', self.input_path, '--poly', str(self.spin_verts.value())]
+        if self.chk_bake.isChecked():
+            args.append('--bake')
+        if getattr(self, 'chk_force_high', None) and self.chk_force_high.isChecked():
+            args.append('--force-high')
+        tre = self.trellis_input.text().strip()
+        if tre:
+            args.extend(['--trellis-weights', tre])
+        # Quality flags
+        q = self.quality_combo.currentText()
+        args.extend(['--quality', q])
+        if q == 'custom':
+            args.extend(['--mc-resolution', str(self.custom_mc.value())])
+            args.extend(['--texture-resolution', str(self.custom_tex.value())])
+        # Optional render and metrics toggles (hidden until high-quality may benefit)
+        try:
+            self.chk_render
+        except Exception:
+            self.chk_render = QCheckBox('Render (NeRF)')
+            self.chk_metrics = QCheckBox('Compute metrics')
+            # Safely obtain the left layout from the central splitter widget
+            left_l = None
+            central = self.centralWidget()
+            try:
+                from PySide6.QtWidgets import QSplitter
+                if isinstance(central, QSplitter):
+                    left_widget = central.widget(0)
+                    if left_widget is not None and hasattr(left_widget, 'layout'):
+                        left_l = left_widget.layout()
+                elif central is not None and hasattr(central, 'layout'):
+                    left_l = central.layout()
+            except Exception:
+                # best-effort fallback in case imports fail at runtime
+                if central is not None and hasattr(central, 'layout'):
+                    left_l = central.layout()
+                else:
+                    left_l = None
+            if left_l:
+                left_l.addWidget(self.chk_render)
+                left_l.addWidget(self.chk_metrics)
+        if getattr(self, 'chk_render', None) and self.chk_render.isChecked():
+            args.append('--render')
+        if getattr(self, 'chk_metrics', None) and self.chk_metrics.isChecked():
+            args.append('--metrics')
+        # Ensure blender is a string (QSettings.value may return object/None)
+        blender = self.blender_input.text().strip()
+        if not blender:
+            blender = str(_SETTINGS.value('blender_exe', ''))
+        env = os.environ.copy()
+        if blender:
+            env['BLENDER_EXE'] = blender
+        self.log.appendPlainText('Launching: ' + ' '.join(args))
+        if self.process:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+        self.process = QProcess(self)
+        # Prefer the ProcessChannelMode enum (some PySide6 stubs expose it there)
+        try:
+            self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        except Exception:
+            # fallback for environments where attribute resolution differs
+            try:
+                self.process.setProcessChannelMode(QProcess.MergedChannels)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        self.process.setWorkingDirectory(str(ROOT))
+        self.process.readyReadStandardOutput.connect(self._read_output)
+        self.process.finished.connect(self._proc_finished)
+        self.process.start(args[0], args[1:])
+        self.progress.setVisible(True)
+
+    def _read_output(self):
+        from typing import cast
+        # Defensive: handler can be triggered after process was cleared
+        if not self.process:
+            return
+        ba = self.process.readAllStandardOutput()
+        # ba is a QByteArray; extract raw bytes defensively
+        try:
+            raw = cast(bytes, ba.data())
+        except Exception:
+            try:
+                # bytes(QByteArray) works at runtime but static type checkers may complain;
+                # silence the arg-type error here.
+                raw = bytes(ba)  # type: ignore[arg-type]
+            except Exception:
+                raw = b''
+        data = raw.decode('utf-8', errors='ignore')
+        self.log.appendPlainText(data)
+        for line in data.splitlines():
+            # Detect TSR copy diagnostics and auto-add/preview the copied mesh
+            try:
+                if 'TSR:' in line and 'copied' in line:
+                    m = re.search(r'copied\s+.*->\s*(?P<dest>\S+)', line)
+                    if m:
+                        dest = m.group('dest').strip()
+                        try:
+                            pd = Path(dest)
+                            if not pd.is_absolute():
+                                pd = (ROOT / dest).resolve()
+                            dest = str(pd)
+                        except Exception:
+                            pass
+                        existing = [self.outputs.item(i).text() for i in range(self.outputs.count())]
+                        if dest not in existing:
+                            self.outputs.addItem(dest)
+                        try:
+                            if Path(dest).exists():
+                                self.log.appendPlainText('Preview: TSR-produced mesh copied -> ' + dest)
+                                self._display_model(dest)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Structured Auto-setup markers
+            if line.startswith('AUTO_SETUP:'):
+                payload = line.split('AUTO_SETUP:')[1].strip()
+                if payload == 'CONFIG_OK':
+                    self.cfg_status.setText('Config: OK')
+                    self.cfg_status.setStyleSheet('color: #0f0')
+                elif payload == 'CONFIG_FAIL':
+                    self.cfg_status.setText('Config: FAILED')
+                    self.cfg_status.setStyleSheet('color: #f66')
+                elif payload == 'WEIGHTS_OK':
+                    self.weights_status.setText('Weights: OK')
+                    self.weights_status.setStyleSheet('color: #0f0')
+                elif payload == 'WEIGHTS_PRESENT':
+                    self.weights_status.setText('Weights: Present')
+                    self.weights_status.setStyleSheet('color: #0f0')
+                elif payload == 'WEIGHTS_FAIL' or payload == 'WEIGHTS_NONE':
+                    self.weights_status.setText('Weights: MISSING')
+                    self.weights_status.setStyleSheet('color: #f66')
+                elif payload == 'IM_FOUND':
+                    self.im_status.setText('Instant Meshes: Found')
+                    self.im_status.setStyleSheet('color: #0f0')
+                elif payload == 'IM_NOT_FOUND':
+                    self.im_status.setText('Instant Meshes: NOT FOUND')
+                    self.im_status.setStyleSheet('color: #f66')
+                elif payload.startswith('DONE'):
+                    # leave final message to process finished handler
+                    pass
+                # continue to next log line
+                continue
+
+            # Detect OBJ/UV-OBJ/Baked lines and extract the path robustly using a regex
+            m = re.search(r'(?:OBJ|UV-OBJ|Baked):\s*(?P<path>.+)$', line)
+            if m:
+                part = m.group('path').strip().strip("'\"")
+                # Normalize relative workspace paths into an absolute path when possible
+                try:
+                    p = Path(part)
+                    if not p.is_absolute():
+                        # many logs include workspace\clean_quads.obj - resolve relative to project root
+                        p = (ROOT / part).resolve()
+                    part = str(p)
+                except Exception:
+                    pass
+                # Skip duplicates
+                existing = [self.outputs.item(i).text() for i in range(self.outputs.count())]
+                if part in existing:
+                    # already present
+                    continue
+                self.outputs.addItem(part)
+                try:
+                    # Only attempt preview if file exists
+                    if Path(part).exists():
+                        self._display_model(part)
+                    else:
+                        self.log.appendPlainText(f'Preview skipped (file not found): {part}')
+                except Exception as e:
+                    self.log.appendPlainText(f'Preview failed: {e}')
+
+    def _clean_output_text(self, text: str) -> str:
+        """Extract a clean path from a log line that may include timestamps or prefixes.
+        Returns the cleaned path or the original text if no path marker found."""
+        m = re.search(r'(?:OBJ|UV-OBJ|Baked):\s*(?P<path>.+)$', text)
+        if m:
+            p = m.group('path').strip().strip("'\"")
+            # If the extracted token is clearly a stray short editor token (e.g., 'Exc'),
+            # treat it as empty so `_sanitize_outputs` can skip it.
+            try:
+                if re.fullmatch(r'[A-Za-z]{1,6}', p):
+                    return ''
+            except Exception:
+                pass
+            try:
+                pp = Path(p)
+                if not pp.is_absolute():
+                    pp = (ROOT / p).resolve()
+                return str(pp)
+            except Exception:
+                return p
+        return '' if text and re.fullmatch(r'[A-Za-z]{1,6}', text.strip()) else text
+
+    def _sanitize_outputs(self):
+        """Normalize existing entries in the outputs list: remove duplicates, resolve relative paths, and drop non-existent files."""
+        try:
+            cleaned = []
+            for i in range(self.outputs.count()):
+                raw = self.outputs.item(i).text()
+                c = self._clean_output_text(raw)
+                if c not in cleaned:
+                    cleaned.append(c)
+            self.outputs.clear()
+            for p in cleaned:
+                # Skip empty or clearly stray tokens
+                if not p or (isinstance(p, str) and re.fullmatch(r'[A-Za-z]{1,6}', p.strip())):
+                    continue
+                # Only re-add entries that look like paths
+                try:
+                    if Path(p).exists():
+                        self.outputs.addItem(p)
+                    else:
+                        # still add the path for visibility but mark missing
+                        self.outputs.addItem(p + ' (missing)')
+                except Exception:
+                    self.outputs.addItem(p)
+        except Exception:
+            pass
+
+    def _proc_finished(self, code, status):
+        self.progress.setVisible(False)
+        self.log.appendPlainText(f'Process finished (code={code})')
+        # If auto-setup was running, re-enable its action and notify user
+        if getattr(self, '_auto_running', False):
+            self._auto_running = False
+            try:
+                self.auto_act.setEnabled(True)
+                self.auto_act.setText('Auto Setup')
+            except Exception:
+                pass
+            if code == 0:
+                QMessageBox.information(self, 'Auto Setup', 'Auto setup completed successfully.')
+            else:
+                QMessageBox.warning(self, 'Auto Setup', f'Auto setup failed (exit code {code}). Check logs for details.')
+
+    def _on_viewer_model_loaded(self):
+        # Hide overlay and log event
+        try:
+            if getattr(self, 'loading_overlay', None):
+                self.loading_overlay.setVisible(False)
+        except Exception:
+            pass
+        self.log.appendPlainText('Preview: model loaded in viewer')
+
+    def stop_pipeline(self):
+        if self.process:
+            try:
+                self.process.kill()
+                self.log.appendPlainText('Process terminated by user')
+            except Exception as e:
+                self.log.appendPlainText('Failed to terminate: ' + str(e))
+
+    def _open_output(self, item):
+        path = item.text()
+        try:
+            os.startfile(path)
+        except Exception as e:
+            QMessageBox.warning(self, 'Open failed', str(e))
+
+    def _display_model(self, path: str):
+        # If we have a web viewer, try to convert OBJ to GLB and display it
+        try:
+            p = Path(path)
+            # show loading overlay if available
+            try:
+                if getattr(self, 'loading_overlay', None):
+                    self.loading_overlay.setGeometry(0, 0, self.web_view.width(), self.web_view.height())
+                    self.loading_overlay.setVisible(True)
+            except Exception:
+                pass
+
+            if p.suffix.lower() == '.obj':
+                glb = p.with_suffix('.glb')
+                # try to convert using trimesh for reliable GLB export
+                try:
+                    import trimesh as _tm
+                    m = _tm.load(str(p), force='mesh')
+                    m.export(str(glb))
+                except Exception:
+                    # conversion failed; leave glb as original obj
+                    glb = p
+                target_file = glb
+            else:
+                target_file = p
+
+            # Build a file:// URL so the viewer can fetch the local file reliably
+            file_url = QUrl.fromLocalFile(str(target_file)).toString()
+
+            if getattr(self, 'web_view', None) is not None:
+                # Use a JS wrapper that retries until the viewer's loadModel function is available.
+                # This avoids "loadModel is not defined" errors if the page hasn't finished initializing.
+                safe_url = file_url.replace("'", "\\'")
+                js = f"(function waitAndLoad(){{ const u = '{safe_url}'; if (typeof loadModel === 'function') {{ loadModel(u); }} else {{ setTimeout(waitAndLoad, 200); }} }})();"
+                try:
+                    # Log the exact URL we're passing to the page for diagnostics
+                    self.log.appendPlainText('Preview: requesting viewer to load URL: ' + file_url)
+                    self.web_view.page().runJavaScript(js)
+                    self.log.appendPlainText('Preview: Loading into viewer ' + str(target_file))
+                except Exception:
+                    # fallback: try direct invocation once
+                    try:
+                        self.web_view.page().runJavaScript(f"try{{ loadModel('{safe_url}'); }}catch(e){{console.error(e);}}")
+                        self.log.appendPlainText('Preview: Loading into viewer (fallback) ' + str(target_file))
+                    except Exception as e:
+                        self.log.appendPlainText('Preview: runJavaScript failed: ' + str(e))
+
+                # Prefer WebChannel file delivery when available (safer than file:// and JS injection)
+                try:
+                    if getattr(self, 'web_bridge', None) is not None and Path(target_file).exists():
+                        size = Path(target_file).stat().st_size
+                        # only attempt WebChannel transfer for reasonably sized files
+                        if size <= 50 * 1024 * 1024:  # 50 MB threshold for WebChannel transfer
+                            try:
+                                with open(target_file, 'rb') as _fh:
+                                    _b64 = base64.b64encode(_fh.read()).decode('ascii')
+                                # Emit the signal the JS viewer listens for; JS should handle fileLoaded(path, b64)
+                                try:
+                                    self.web_bridge.fileLoaded.emit(file_url, _b64)
+                                    self.log.appendPlainText(f'Preview: served model to viewer via WebChannel (size={size} bytes)')
+                                except Exception as _e:
+                                    self.log.appendPlainText('Preview: WebChannel emit failed: ' + str(_e))
+                            except Exception as e:
+                                self.log.appendPlainText('Preview: failed to read/encode file for WebChannel: ' + str(e))
+                        else:
+                            self.log.appendPlainText(f'Preview: model file too large for WebChannel transfer ({size} bytes), will try JS injection fallback')
+                    else:
+                        # Robust fallback: inject the GLB as base64 into the page using a safe JS helper
+                        if Path(target_file).exists():
+                            size = Path(target_file).stat().st_size
+                            if size <= 25 * 1024 * 1024:  # 25 MB threshold
+                                try:
+                                    with open(target_file, 'rb') as _fh:
+                                        _b64 = base64.b64encode(_fh.read()).decode('ascii')
+                                    js_b64 = f"try{{ if(typeof window._loadBase64Model === 'function') {{ window._loadBase64Model({json.dumps(_b64)}); }} }}catch(e){{console.error(e);}}"
+                                    self.log.appendPlainText(f'Preview: injecting base64 model into viewer (size={size} bytes)')
+                                    try:
+                                        self.web_view.page().runJavaScript(js_b64)
+                                    except Exception as e:
+                                        self.log.appendPlainText('Preview: base64 injection runJavaScript failed: ' + str(e))
+                                except Exception as e:
+                                    self.log.appendPlainText('Preview: failed to encode base64: ' + str(e))
+                            else:
+                                self.log.appendPlainText(f'Preview: model file too large for base64 injection ({size} bytes), skipping injection')
+                except Exception as e:
+                    self.log.appendPlainText('Preview: WebChannel/base64 transfer error: ' + str(e))
+
+                # the viewer will call back via WebChannel when finished; set a fallback timeout
+                try:
+                    from PySide6.QtCore import QTimer
+                    def _hide_on_timeout():
+                        try:
+                            if getattr(self, 'loading_overlay', None):
+                                self.loading_overlay.setVisible(False)
+                        except Exception:
+                            pass
+                        self.log.appendPlainText('Preview: load timeout/complete')
+                        # Fallback: try to open with trimesh external viewer if the file exists
+                        try:
+                            if Path(target_file).exists():
+                                    try:
+                                        os.startfile(str(target_file))
+                                        self.log.appendPlainText('Preview: opened OS default viewer for ' + str(target_file))
+                                    except Exception:
+                                        # As a last resort, attempt trimesh viewer (may require pyglet
+                                        # and must run in main thread; spawn only if unavoidable).
+                                        try:
+                                            import trimesh as _tm
+                                            scene = _tm.load(str(target_file), force='scene')
+                                            import threading
+                                            def _show():
+                                                try:
+                                                    scene.show()
+                                                except Exception as _e:
+                                                    self.log.appendPlainText('External viewer error: ' + str(_e))
+                                            t = threading.Thread(target=_show, daemon=True)
+                                            t.start()
+                                            self.log.appendPlainText('Preview: fallback opened external viewer for ' + str(target_file))
+                                        except Exception:
+                                            self.log.appendPlainText('Preview: unable to open external viewer for ' + str(target_file))
+                        except Exception:
+                            pass
+                    QTimer.singleShot(15000, _hide_on_timeout)
+                except Exception:
+                    pass
+            else:
+                # Fallback: try to open a native trimesh viewer in a separate window
+                try:
+                    # Prefer opening with the OS default viewer (avoids pyglet main-loop issues)
+                    try:
+                        os.startfile(str(p))
+                        self.log.appendPlainText('Preview: opened OS default viewer for ' + str(p))
+                    except Exception:
+                        import trimesh as _tm
+                        scene = _tm.load(str(p), force='scene')
+                        # show() may require pyglet to run in the main thread; attempt in a thread as fallback
+                        import threading
+                        def _show():
+                            try:
+                                scene.show()
+                            except Exception as e:
+                                self.log.appendPlainText('External viewer error: ' + str(e))
+                        t = threading.Thread(target=_show, daemon=True)
+                        t.start()
+                        self.log.appendPlainText('Preview: fallback opened external viewer for ' + str(p))
+
+                    # hide overlay when external viewer is launched
+                    try:
+                        if getattr(self, 'loading_overlay', None):
+                            self.loading_overlay.setVisible(False)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.log.appendPlainText('Preview fallback error: ' + str(e))
+                    try:
+                        if getattr(self, 'loading_overlay', None):
+                            self.loading_overlay.setVisible(False)
+                    except Exception:
+                        pass
+        except Exception as e:
+            self.log.appendPlainText('Preview error: ' + str(e))
+
+    def open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec() == QDialog.Accepted:  # type: ignore[attr-defined]
+            self._load_settings()
+
+    def _auto_setup(self):
+        # Run the auto setup script and stream logs to the UI
+        if self.process:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+        # clear previous outputs/logs for clarity
+        try:
+            self.outputs.clear()
+        except Exception:
+            pass
+        self.log.appendPlainText('Starting Auto Setup...')
+        self._auto_running = True
+        try:
+            self.auto_act.setEnabled(False)
+            self.auto_act.setText('Auto Setup (running...)')
+        except Exception:
+            pass
+        self.process = QProcess(self)
+        try:
+            self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        except Exception:
+            try:
+                self.process.setProcessChannelMode(QProcess.MergedChannels)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        self.process.setWorkingDirectory(str(ROOT))
+        self.process.readyReadStandardOutput.connect(self._read_output)
+        self.process.finished.connect(self._proc_finished)
+        self.process.start(sys.executable, [str(ROOT / 'scripts' / 'auto_setup.py')])
+        self.progress.setVisible(True)
+
+    def _test_viewer_load(self):
+        """Developer helper: test viewer loading via WebChannel or file:///JS.
+        Picks the most recent output in the `Outputs` list, or falls back to
+        workspace/clean_quads.glb if present."""
+        try:
+            # determine a candidate file
+            candidate = None
+            try:
+                if self.outputs.count() > 0:
+                    candidate = self.outputs.item(0).text()
+                # ensure candidate is a path
+                if candidate and '(missing)' in candidate:
+                    candidate = candidate.replace(' (missing)', '')
+                if not candidate:
+                    default = ROOT / 'workspace' / 'clean_quads.glb'
+                    if default.exists():
+                        candidate = str(default)
+            except Exception:
+                candidate = None
+
+            if not candidate:
+                self.log.appendPlainText('Test Viewer: no candidate model found to test')
+                return
+
+            tgt = Path(candidate)
+            if not tgt.exists():
+                self.log.appendPlainText('Test Viewer: candidate does not exist: ' + str(candidate))
+                return
+
+            file_url = QUrl.fromLocalFile(str(tgt)).toString()
+            self.log.appendPlainText('Test Viewer: attempting WebChannel delivery for ' + str(tgt))
+            # If WebChannel available, send via fileLoaded; otherwise invoke loadModel JS
+            try:
+                if getattr(self, 'web_bridge', None) is not None:
+                    try:
+                        with open(tgt, 'rb') as fh:
+                            b64 = base64.b64encode(fh.read()).decode('ascii')
+                        # emit and log
+                        self.web_bridge.fileLoaded.emit(file_url, b64)
+                        self.log.appendPlainText('Test Viewer: emitted fileLoaded via WebChannel (size=' + str(len(b64)) + ')')
+                        return
+                    except Exception as e:
+                        self.log.appendPlainText('Test Viewer: WebChannel emit failed: ' + str(e))
+                # fallback: call loadModel via JS
+                js = f"try{{ loadModel('{file_url}'); }}catch(e){{console.error(e);}}"
+                try:
+                    self.web_view.page().runJavaScript(js)
+                    self.log.appendPlainText('Test Viewer: invoked loadModel JS for ' + str(tgt))
+                except Exception as e:
+                    self.log.appendPlainText('Test Viewer: runJavaScript failed: ' + str(e))
+            except Exception as e:
+                self.log.appendPlainText('Test Viewer error: ' + str(e))
+        except Exception as e:
+            self.log.appendPlainText('Test Viewer unexpected error: ' + str(e))
+
+    def _open_command_center(self):
+        """Launch the CustomTkinter-based NeoForge Command Center in a separate process."""
+        try:
+            cmd = [sys.executable, str(ROOT / 'gui' / 'game_ui.py')]
+            self.log.appendPlainText('Launching Command Center: ' + ' '.join(cmd))
+            subprocess.Popen(cmd, cwd=str(ROOT))
+        except Exception as e:
+            self.log.appendPlainText('Failed to launch Command Center: ' + str(e))
+            try:
+                QMessageBox.warning(self, 'Launch failed', str(e))
+            except Exception:
+                pass
+
+def main():
+
+    app = QApplication(sys.argv)
+    w = DesktopApp()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    main()

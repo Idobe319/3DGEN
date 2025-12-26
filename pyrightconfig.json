@@ -1,0 +1,13 @@
+{
+  "executionEnvironments": [
+    {
+      "root": "./",
+      "extraPaths": [
+        ".venv/Lib/site-packages",
+        "./"
+      ]
+    }
+  ],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true
+}
