@@ -69,3 +69,14 @@ datasets/
 *.pth
 *.onnx
 *.engine
+
+# compiled python
+**/__pycache__/
+**/*.pyc
+
+
+# external repos (fetched by scripts)
+external/TRELLIS/
+external/TripoSR/
+external/spconv_build/
+
